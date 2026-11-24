@@ -41,6 +41,10 @@ export interface Params {
   maxDevBuySol: number;
   /** Distinct non-creator buyers before entry, at most (a launch bundled by many wallets is a dump in waiting). */
   maxBuyers: number;
+  /** Distinct non-creator buyers before entry, at least (real interest, not a bare launch). */
+  minBuyers: number;
+  /** SOL bought by non-creators before entry, at least. */
+  minBoughtSol: number;
   /** Skip the coin when the creator has sold before entry. */
   skipDevSold: boolean;
   /** Slippage allowed on buys (bps). */
@@ -81,8 +85,8 @@ export interface Params {
 }
 
 export const DEFAULT_PARAMS: Params = {
-  minAge: 0,
-  maxAge: 4,
+  minAge: 2,
+  maxAge: 8,
   firstBuySol: 0.08,
   addSol: 0.08,
   stakeSol: 0.16,
@@ -91,15 +95,17 @@ export const DEFAULT_PARAMS: Params = {
   maxRqSol: 20,
   maxDevBuySol: 1.5,
   maxBuyers: 2,
+  minBuyers: 2,
+  minBoughtSol: 0.4,
   skipDevSold: true,
   buySlipBps: 10000,
-  partialTp: 0.2,
+  partialTp: 100,
   partialShare: 0.5,
-  fullTp: 0.6,
-  stopLoss: 0.1,
-  trailArm: 0.3,
+  fullTp: 0.18,
+  stopLoss: 0.09,
+  trailArm: 100,
   trail: 0.25,
-  maxHold: 40,
+  maxHold: 18,
   exitOnDevSell: true,
   addMinUp: 0.1,
   addFlowWindow: 10,
@@ -129,7 +135,11 @@ interface Coin {
   creator: string;
   devBuySol: number;
   buyers: Set<string>;
+  boughtSol: number;
   devSold: boolean;
+  /** Create-time virtual reserves (the price run-up is measured against them). */
+  vq0: bigint;
+  vt0: bigint;
   trades: Trade[];
   entries: number;
   lastExit: number;
@@ -165,7 +175,10 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         creator: '',
         devBuySol: 0,
         buyers: new Set(),
+        boughtSol: 0,
         devSold: false,
+        vq0: 0n,
+        vt0: 1n,
         trades: [],
         entries: 0,
         lastExit: -1e12,
@@ -215,6 +228,8 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           const c = coinOf(e.mint);
           c.created = e.slot;
           c.creator = e.creator;
+          c.vq0 = BigInt(e.virtual_quote_reserves);
+          c.vt0 = BigInt(e.virtual_token_reserves);
         } else if (e.event === 'TradeEvent') {
           const c = coinOf(e.mint);
           const sol = Number(e.sol_amount) / LAMPORTS;
@@ -223,7 +238,10 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           const isDev = e.user === c.creator;
           if (e.is_buy) {
             if (isDev && e.slot === c.created) c.devBuySol += sol;
-            else if (!isDev) c.buyers.add(e.user);
+            else if (!isDev) {
+              c.buyers.add(e.user);
+              c.boughtSol += sol;
+            }
           } else if (isDev) {
             c.devSold = true;
           }
@@ -350,7 +368,10 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           if (rqSol < p.minRqSol || rqSol > p.maxRqSol) continue;
           if (c.devBuySol > p.maxDevBuySol) continue;
           if (c.buyers.size > p.maxBuyers) continue;
+          if (c.buyers.size < p.minBuyers || c.boughtSol < p.minBoughtSol) continue;
           if (p.skipDevSold && c.devSold) continue;
+          // Momentum confirmation: the price must be at or above its create price (not already dumping).
+          if (curve.virtual_quote_reserves * c.vt0 < c.vq0 * curve.virtual_token_reserves) continue;
           const capLamports = state.maxBuyLamports(mint);
           let amount = BigInt(Math.floor(p.firstBuySol * LAMPORTS));
           if (amount > capLamports) amount = capLamports;
